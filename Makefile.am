@@ -2626,21 +2626,13 @@ test_pamsrv_json_LDADD = \
     $(NULL)
 
 test_oidc_child_json_SOURCES = \
-    src/oidc_child/oidc_child_curl.c \
-    src/oidc_child/oidc_child_id.c \
-    src/util/atomic_io.c \
-    src/util/memory.c \
-    src/util/memory_erase.c \
     src/util/strtonum.c \
-    src/util/sss_chain_id.c \
-    src/util/sss_prctl.c \
     src/tests/cmocka/test_oidc_child_json.c \
     $(NULL)
 test_oidc_child_json_CFLAGS = \
     $(AM_CFLAGS) \
     $(JANSSON_CFLAGS) \
     $(JOSE_CFLAGS) \
-    $(CURL_CFLAGS) \
     $(POPT_CFLAGS) \
     $(NULL)
 test_oidc_child_json_LDADD = \
@@ -2649,7 +2641,6 @@ test_oidc_child_json_LDADD = \
     $(POPT_LIBS) \
     $(JANSSON_LIBS) \
     $(JOSE_LIBS) \
-    $(CURL_LIBS) \
     libsss_debug.la \
     libsss_test_common.la \
     $(NULL)
