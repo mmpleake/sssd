@@ -472,6 +472,104 @@ static const char *get_id_string(TALLOC_CTX *mem_ctx, json_t *id_object)
     return NULL;
 }
 
+/* ---------------------------------------------------------------------------
+ * AD hybrid support: decode onPremisesImmutableId to AD objectGUID
+ *
+ * Azure AD Connect synchronizes the on-premises AD objectGUID to Entra ID
+ * as the onPremisesImmutableId field (standard base64 encoding of the raw
+ * 16-byte GUID). When id_provider=ad and auth_provider=idp, SSSD stores
+ * the AD objectGUID as SYSDB_UUID in the cache. The Entra "id" field is a
+ * different cloud-generated UUID. By decoding onPremisesImmutableId back
+ * to the original objectGUID format, the UUID comparison in
+ * eval_access_token_buf() succeeds.
+ *
+ * Microsoft GUID byte order (bytes_le): the first three groups are stored
+ * in little-endian order, the last two groups in big-endian order.
+ * Raw bytes: [3][2][1][0]-[5][4]-[7][6]-[8][9]-[10][11][12][13][14][15]
+ *
+ * For cloud-only users (no on-premises AD object), onPremisesImmutableId
+ * is absent from the Graph API response and this function returns NULL,
+ * causing the caller to fall back to the Entra "id" field.
+ * ------------------------------------------------------------------------ */
+
+static int base64_decode_char(char c)
+{
+    if (c >= 'A' && c <= 'Z') return c - 'A';
+    if (c >= 'a' && c <= 'z') return c - 'a' + 26;
+    if (c >= '0' && c <= '9') return c - '0' + 52;
+    if (c == '+') return 62;
+    if (c == '/') return 63;
+    return -1;
+}
+
+static ssize_t base64_decode(const char *input, uint8_t *output,
+                             size_t output_size)
+{
+    size_t in_len;
+    size_t out_len;
+    size_t i;
+    size_t j;
+    uint32_t sextet_a, sextet_b, sextet_c, sextet_d, triple;
+
+    if (input == NULL) return -1;
+
+    in_len = strlen(input);
+    while (in_len > 0 && input[in_len - 1] == '=') in_len--;
+
+    out_len = (in_len * 3) / 4;
+    if (out_len > output_size) return -1;
+
+    for (i = 0, j = 0; i < in_len; ) {
+        sextet_a = (i < in_len) ? base64_decode_char(input[i++]) : 0;
+        sextet_b = (i < in_len) ? base64_decode_char(input[i++]) : 0;
+        sextet_c = (i < in_len) ? base64_decode_char(input[i++]) : 0;
+        sextet_d = (i < in_len) ? base64_decode_char(input[i++]) : 0;
+
+        triple = (sextet_a << 18) | (sextet_b << 12)
+               | (sextet_c << 6)  | sextet_d;
+
+        if (j < out_len) output[j++] = (triple >> 16) & 0xFF;
+        if (j < out_len) output[j++] = (triple >> 8)  & 0xFF;
+        if (j < out_len) output[j++] =  triple        & 0xFF;
+    }
+
+    return (ssize_t) out_len;
+}
+
+static const char *decode_onprem_immutable_id(TALLOC_CTX *mem_ctx,
+                                              json_t *userinfo)
+{
+    json_t *immutable_id;
+    const char *b64_value;
+    uint8_t guid_bytes[16];
+    ssize_t decoded_len;
+
+    immutable_id = json_object_get(userinfo, "onPremisesImmutableId");
+    if (immutable_id == NULL || !json_is_string(immutable_id)) {
+        return NULL;
+    }
+
+    b64_value = json_string_value(immutable_id);
+    decoded_len = base64_decode(b64_value, guid_bytes, sizeof(guid_bytes));
+    if (decoded_len != 16) {
+        DEBUG(SSSDBG_MINOR_FAILURE,
+              "onPremisesImmutableId base64 decode produced %zd bytes, "
+              "expected 16.\n", decoded_len);
+        return NULL;
+    }
+
+    /* Microsoft GUID bytes_le format: first 3 groups little-endian,
+     * last 2 groups big-endian. */
+    return talloc_asprintf(mem_ctx,
+        "%02x%02x%02x%02x-%02x%02x-%02x%02x-%02x%02x-%02x%02x%02x%02x%02x%02x",
+        guid_bytes[3],  guid_bytes[2],  guid_bytes[1],  guid_bytes[0],
+        guid_bytes[5],  guid_bytes[4],
+        guid_bytes[7],  guid_bytes[6],
+        guid_bytes[8],  guid_bytes[9],
+        guid_bytes[10], guid_bytes[11], guid_bytes[12],
+        guid_bytes[13], guid_bytes[14], guid_bytes[15]);
+}
+
 const char *get_user_identifier(TALLOC_CTX *mem_ctx, json_t *userinfo,
                                 const char *user_identifier_attr,
                                 const char *user_info_type)
@@ -506,6 +604,23 @@ const char *get_user_identifier(TALLOC_CTX *mem_ctx, json_t *userinfo,
     if (user_identifier == NULL) {
         DEBUG(SSSDBG_CRIT_FAILURE,
               "No attribute to identify the user found.\n");
+    } else if (user_info_type == NULL) {
+        /* user_info_type == NULL means this is the userinfo endpoint response
+         * (not an id_token or access_token payload). Only the userinfo
+         * response from the Graph API contains onPremisesImmutableId. */
+        const char *onprem_uuid;
+
+        onprem_uuid = decode_onprem_immutable_id(mem_ctx, userinfo);
+        if (onprem_uuid != NULL) {
+            DEBUG(SSSDBG_CONF_SETTINGS,
+                  "Found onPremisesImmutableId, using decoded AD objectGUID "
+                  "[%s] instead of Entra id [%s].\n",
+                  onprem_uuid, user_identifier);
+            user_identifier = onprem_uuid;
+        } else {
+            DEBUG(SSSDBG_TRACE_FUNC,
+                  "onPremisesImmutableId not found, using Entra id.\n");
+        }
     } else {
         DEBUG(SSSDBG_CONF_SETTINGS, "User identifier: [%s].\n",
                                     user_identifier);
